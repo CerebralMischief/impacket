@@ -30,7 +30,8 @@ from impacket.krb5.gssapi import CheckSumField, GSS_C_DCE_STYLE, GSS_C_MUTUAL_FL
 from impacket.krb5 import constants
 from impacket.krb5.crypto import Key, _enctype_table
 from impacket.smbconnection import SessionError
-from impacket.spnego import SPNEGO_NegTokenInit, TypesMech, SPNEGO_NegTokenResp
+from impacket.spnego import SPNEGO_NegTokenInit, TypesMech, SPNEGO_NegTokenResp, ASN1_OID, asn1encode, ASN1_AID
+from impacket.krb5.gssapi import KRB5_AP_REQ
 from impacket import nt_errors, LOG
 from impacket.krb5.ccache import CCache
 
@@ -451,11 +452,11 @@ def getKerberosType1(username, password, domain, lmhash, nthash, aesKey='', TGT 
                 # No cache present
                 pass
             else:
-                # retrieve user and domain information from CCache file if needed
-                if username == '' and len(ccache.principal.components) > 0:
-                    username = ccache.principal.components[0]['data']
+                # retrieve domain information from CCache file if needed
                 if domain == '':
                     domain = ccache.principal.realm['data']
+                    LOG.debug('Domain retrieved from CCache: %s' % domain)
+
                 LOG.debug("Using Kerberos Cache: %s" % os.getenv('KRB5CCNAME'))
                 principal = 'host/%s@%s' % (targetName.upper(), domain.upper())
                 creds = ccache.getCredential(principal)
@@ -470,6 +471,14 @@ def getKerberosType1(username, password, domain, lmhash, nthash, aesKey='', TGT 
                         LOG.debug("No valid credentials found in cache. ")
                 else:
                     TGS = creds.toTGS()
+
+                # retrieve user information from CCache file if needed
+                if username == '' and creds is not None:
+                    username = creds['client'].prettyPrint().split('@')[0]
+                    LOG.debug('Username retrieved from CCache: %s' % username)
+                elif username == '' and len(ccache.principal.components) > 0:
+                    username = ccache.principal.components[0]['data']
+                    LOG.debug('Username retrieved from CCache: %s' % username)
 
     # First of all, we need to get a TGT for the user
     userName = Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
@@ -583,7 +592,8 @@ def getKerberosType1(username, password, domain, lmhash, nthash, aesKey='', TGT 
     apReq['authenticator']['etype'] = cipher.enctype
     apReq['authenticator']['cipher'] = encryptedEncodedAuthenticator
 
-    blob['MechToken'] = encoder.encode(apReq)
+    blob['MechToken'] = struct.pack('B', ASN1_AID) + asn1encode( struct.pack('B', ASN1_OID) + asn1encode(
+            TypesMech['KRB5 - Kerberos 5'] ) + KRB5_AP_REQ + encoder.encode(apReq))
 
     return cipher, sessionKey, blob.getData()
 

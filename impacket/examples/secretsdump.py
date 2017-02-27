@@ -65,7 +65,7 @@ from impacket.ese import ESENT_DB
 from impacket.nt_errors import STATUS_MORE_ENTRIES
 from impacket.structure import Structure
 from impacket.winregistry import hexdump
-
+from impacket.uuid import string_to_bin
 try:
     from Crypto.Cipher import DES, ARC4, AES
     from Crypto.Hash import HMAC, MD4
@@ -260,7 +260,8 @@ class RemoteFile:
 class RemoteOperations:
     def __init__(self, smbConnection, doKerberos, kdcHost=None):
         self.__smbConnection = smbConnection
-        self.__smbConnection.setTimeout(5*60)
+        if self.__smbConnection is not None:
+            self.__smbConnection.setTimeout(5*60)
         self.__serviceName = 'RemoteRegistry'
         self.__stringBindingWinReg = r'ncacn_np:445[\pipe\winreg]'
         self.__rrp = None
@@ -336,6 +337,10 @@ class RemoteOperations:
             self.__drsr.set_auth_type(RPC_C_AUTHN_GSS_NEGOTIATE)
         self.__drsr.connect()
         self.__drsr.bind(drsuapi.MSRPC_UUID_DRSUAPI)
+
+        if self.__domainName is None:
+            # Get domain name from credentials cached
+            self.__domainName = rpc.get_credentials()[2]
 
         request = drsuapi.DRSBind()
         request['puuidClientDsa'] = drsuapi.NTDSAPI_CLIENT_GUID
@@ -417,10 +422,10 @@ class RemoteOperations:
 
         dsName = drsuapi.DSNAME()
         dsName['SidLen'] = 0
-        dsName['Guid'] = drsuapi.NULLGUID
+        dsName['Guid'] = string_to_bin(userEntry[1:-1])
         dsName['Sid'] = ''
-        dsName['NameLen'] = len(userEntry)
-        dsName['StringName'] = (userEntry + '\x00')
+        dsName['NameLen'] = 0
+        dsName['StringName'] = ('\x00')
 
         dsName['structLen'] = len(dsName.getData())
 
@@ -604,7 +609,13 @@ class RemoteOperations:
         if self.__samr is not None:
             self.__samr.disconnect()
         if self.__scmr is not None:
-            self.__scmr.disconnect()
+            try:
+                self.__scmr.disconnect()
+            except Exception, e:
+                if str(e).find('STATUS_INVALID_PARAMETER') >=0:
+                    pass
+                else:
+                    raise
 
     def getBootKey(self):
         bootKey = ''
@@ -1227,7 +1238,10 @@ class LSASecrets(OfflineRegistry):
             # Default print, hexdump
             printableSecret  = '%s:%s' % (name, hexlify(secretItem))
             self.__secretItems.append(printableSecret)
-            hexdump(secretItem)
+            # If we're using the default callback (ourselves), we print the hex representation. If not, the
+            # user will need to decide what to do.
+            if self.__module__ == self.__perSecretCallback.__module__:
+                hexdump(secretItem)
             
         self.__perSecretCallback(LSASecrets.SECRET_TYPE.LSA, printableSecret)
 
@@ -1869,7 +1883,19 @@ class NTDSHashes:
             if self.__NTDS is None:
                 # DRSUAPI method, checking whether target is a DC
                 try:
-                    self.__remoteOps.connectSamr(self.__remoteOps.getMachineNameAndDomain()[1])
+                    if self.__remoteOps is not None:
+                        try:
+                            self.__remoteOps.connectSamr(self.__remoteOps.getMachineNameAndDomain()[1])
+                        except:
+                            if os.getenv('KRB5CCNAME') is not None and self.__justUser is not None:
+                                # RemoteOperations failed. That might be because there was no way to log into the
+                                # target system. We just have a last resort. Hope we have tickets cached and that they
+                                # will work
+                                pass
+                            else:
+                                raise
+                    else:
+                        raise Exception('No remote Operations available')
                 except Exception, e:
                     LOG.debug('Exiting NTDSHashes.dump() because %s' % e)
                     # Target's not a DC
@@ -1975,7 +2001,7 @@ class NTDSHashes:
 
                 if self.__justUser is not None:
                     crackedName = self.__remoteOps.DRSCrackNames(drsuapi.DS_NT4_ACCOUNT_NAME_SANS_DOMAIN,
-                                                                 drsuapi.DS_NAME_FORMAT.DS_FQDN_1779_NAME,
+                                                                 drsuapi.DS_NAME_FORMAT.DS_UNIQUE_ID_NAME,
                                                                  name=self.__justUser)
 
                     if crackedName['pmsgOut']['V1']['pResult']['cItems'] == 1:
@@ -2028,7 +2054,7 @@ class NTDSHashes:
                             # I could use it when calling DRSGetNCChanges inside the DSNAME parameter.
                             # For some reason tho, I get ERROR_DS_DRA_BAD_DN when doing so.
                             crackedName = self.__remoteOps.DRSCrackNames(drsuapi.DS_NAME_FORMAT.DS_SID_OR_SID_HISTORY_NAME,
-                                                                         drsuapi.DS_NAME_FORMAT.DS_FQDN_1779_NAME,
+                                                                         drsuapi.DS_NAME_FORMAT.DS_UNIQUE_ID_NAME,
                                                                          name=userSid.formatCanonical())
 
                             if crackedName['pmsgOut']['V1']['pResult']['cItems'] == 1:

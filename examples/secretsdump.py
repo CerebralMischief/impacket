@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 # Copyright (c) 2003-2016 CORE Security Technologies
 #
 # This software is provided under a slightly modified version
@@ -113,7 +113,18 @@ class DumpSecrets:
                 self.__isRemote = True
                 bootKey = None
                 try:
-                    self.connect()
+                    try:
+                        self.connect()
+                    except:
+                        if os.getenv('KRB5CCNAME') is not None and self.__doKerberos is True:
+                            # SMBConnection failed. That might be because there was no way to log into the
+                            # target system. We just have a last resort. Hope we have tickets cached and that they
+                            # will work
+                            logging.debug('SMBConnection didn\'t work, hoping Kerberos will help')
+                            pass
+                        else:
+                            raise
+
                     self.__remoteOps  = RemoteOperations(self.__smbConnection, self.__doKerberos, self.__kdcHost)
                     if self.__justDC is False and self.__justDCNTLM is False or self.__useVSSMethod is True:
                         self.__remoteOps.enableRegistry()
@@ -122,7 +133,13 @@ class DumpSecrets:
                         self.__noLMHash = self.__remoteOps.checkNoLMHashPolicy()
                 except Exception, e:
                     self.__canProcessSAMLSA = False
-                    logging.error('RemoteOperations failed: %s' % str(e))
+                    if str(e).find('STATUS_USER_SESSION_DELETED') and os.getenv('KRB5CCNAME') is not None \
+                        and self.__doKerberos is True:
+                        # Giving some hints here when SPN target name validation is set to something different to Off
+                        # This will prevent establishing SMB connections using TGS for SPNs different to cifs/
+                        logging.error('Policy SPN target name validation might be restricting full DRSUAPI dump. Try -just-dc-user')
+                    else:
+                        logging.error('RemoteOperations failed: %s' % str(e))
 
             # If RemoteOperations succeeded, then we can extract SAM and LSA
             if self.__justDC is False and self.__justDCNTLM is False and self.__canProcessSAMLSA:

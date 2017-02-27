@@ -112,7 +112,8 @@ class SMBConnection:
             if packet[0] == '\xfe':
                 # Answer is SMB2 packet
                 self._SMBConnection = smb3.SMB3(self._remoteName, self._remoteHost, self._myName, hostType,
-                                                self._sess_port, self._timeout, session=self._nmbSession)
+                                                self._sess_port, self._timeout, session=self._nmbSession,
+                                                negSessionResponse=SMB2Packet(packet))
             else:
                 # Answer is SMB packet, sticking to SMBv1
                 self._SMBConnection = smb.SMB(self._remoteName, self._remoteHost, self._myName, hostType,
@@ -297,12 +298,12 @@ class SMBConnection:
                 # No cache present
                 pass
             else:
-                # retrieve user and domain information from CCache file if needed
-                if user == '' and len(ccache.principal.components) > 0:
-                    user=ccache.principal.components[0]['data']
+                LOG.debug("Using Kerberos Cache: %s" % os.getenv('KRB5CCNAME'))
+                # retrieve domain information from CCache file if needed
                 if domain == '':
                     domain = ccache.principal.realm['data']
-                LOG.debug("Using Kerberos Cache: %s" % os.getenv('KRB5CCNAME'))
+                    LOG.debug('Domain retrieved from CCache: %s' % domain)
+
                 principal = 'cifs/%s@%s' % (self.getRemoteName().upper(), domain.upper())
                 creds = ccache.getCredential(principal)
                 if creds is None:
@@ -317,6 +318,14 @@ class SMBConnection:
                 else:
                     TGS = creds.toTGS()
                     LOG.debug('Using TGS from cache')
+
+                # retrieve user information from CCache file if needed
+                if user == '' and creds is not None:
+                    user = creds['client'].prettyPrint().split('@')[0]
+                    LOG.debug('Username retrieved from CCache: %s' % user)
+                elif user == '' and len(ccache.principal.components) > 0:
+                    user = ccache.principal.components[0]['data']
+                    LOG.debug('Username retrieved from CCache: %s' % user)
 
         while True:
             try:
@@ -825,6 +834,18 @@ class SMBConnection:
             return self._SMBConnection.set_session_key(key)
         else:
             return self._SMBConnection.setSessionKey(key)
+            
+    def close(self):
+        """
+        logs off and closes the underlying _NetBIOSSession()
+
+        :return: None
+        """
+        try:
+            self.logoff()
+        except:
+            pass
+        self._SMBConnection.close_session()
 
 class SessionError(Exception):
     """
